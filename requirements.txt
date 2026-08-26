@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+chromadb>=0.5.5
+pypdf>=4.0
+python-multipart>=0.0.9
+sentence-transformers>=3.0
+torch>=2.1
+python-dotenv>=1.0

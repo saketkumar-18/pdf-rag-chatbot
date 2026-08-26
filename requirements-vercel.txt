@@ -1,0 +1,10 @@
+# Serverless runtime deps (Vercel) — deliberately MINIMAL.
+# torch/chromadb/sentence-transformers do NOT fit serverless limits; the JSON
+# backend + fastembed ONNX replace them. Local dev uses requirements.txt.
+fastembed>=0.3,<0.5
+fastapi>=0.115
+starlette>=0.38
+pydantic>=2.7
+python-multipart>=0.0.9
+pypdf>=4.0
+python-dotenv>=1.0

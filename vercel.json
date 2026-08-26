@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxDuration": 60,
+        "memory": 1024,
+        "includeFiles": "static/**, data/index.json, assets/fastembed-cache/**"
+      }
+    }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "/api/index.py" }
+  ],
+  "env": {
+    "RAG_DEPLOYMENT": "serverless",
+    "RAG_RATE_LIMIT_ENABLED": "true"
+  }
+}

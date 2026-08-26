@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/chroma/
+data/uploads/
+.env
+spaces/_build/
+.vercel/
+
+.vercel
+
+assets/
+qr/*placeholder*

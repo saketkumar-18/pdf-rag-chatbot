@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Ask questions about the indexed PDFs and get answers cited to page numbers. No signup, no login — just chat.">
+<meta property="og:title" content="PDF RAG Chatbot — Ask the Docs">
+<meta property="og:description" content="Grounded answers with page-level citations. No signup or login needed.">
+<title>PDF RAG Chatbot — Ask the Docs</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --border: #262b38;
+    --text: #e6e9f0; --muted: #8b93a7; --accent: #4f8cff; --accent2: #37d4a0;
+    --danger: #ff5c74; --chip: #1e2433;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 17px; font-weight: 600; }
+  .spacer { flex: 1; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px; background: var(--chip); color: var(--muted); white-space: nowrap; }
+  .badge.ok { color: var(--accent2); }
+  .badge.bad { color: var(--danger); }
+  .icon-btn { background: var(--chip); border: 1px solid var(--border); color: var(--muted); width: 34px; height: 34px; border-radius: 9px; cursor: pointer; font-size: 16px; display: inline-flex; align-items: center; justify-content: center; }
+  .icon-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  .layout { display: flex; flex: 1; min-height: 0; }
+
+  /* ---- sidebar ---- */
+  aside { width: 300px; border-right: 1px solid var(--border); background: var(--panel); padding: 18px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
+  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  #dropzone { border: 2px dashed var(--border); border-radius: 10px; padding: 22px 12px; text-align: center; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; font-size: 13px; }
+  #dropzone:hover, #dropzone.drag { border-color: var(--accent); background: rgba(79,140,255,.06); color: var(--text); }
+  #docList { display: flex; flex-direction: column; gap: 8px; }
+  .doc { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; background: var(--chip); border-radius: 8px; font-size: 13px; }
+  .doc .meta { min-width: 0; }
+  .doc .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .doc .sub { color: var(--muted); font-size: 11px; }
+  .doc button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px; padding: 2px 6px; border-radius: 6px; }
+  .doc button:hover { color: var(--danger); background: rgba(255,92,116,.1); }
+  .empty-note { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+
+  /* ---- chat ---- */
+  main.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #messages { flex: 1; overflow-y: auto; padding: 26px 30px; display: flex; flex-direction: column; gap: 18px; }
+  .msg { max-width: 78%; line-height: 1.55; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; padding: 11px 16px; border-radius: 14px 14px 3px 14px; }
+  .msg.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); padding: 13px 17px; border-radius: 14px 14px 14px 3px; }
+  .msg.bot.error { border-color: var(--danger); color: var(--danger); }
+  .cite-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; }
+  .chip { font-size: 11px; background: var(--chip); border: 1px solid var(--border); color: var(--muted); padding: 3px 9px; border-radius: 20px; cursor: pointer; }
+  .chip:hover { border-color: var(--accent); color: var(--text); }
+  .src-box { display: none; margin-top: 10px; border-left: 3px solid var(--accent); background: var(--bg); padding: 9px 12px; border-radius: 0 8px 8px 0; font-size: 12.5px; color: var(--muted); max-height: 180px; overflow-y: auto; white-space: pre-wrap; }
+  .typing { display: inline-flex; gap: 5px; padding: 6px 2px; }
+  .typing span { width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1.2s infinite; }
+  .typing span:nth-child(2){ animation-delay:.2s } .typing span:nth-child(3){ animation-delay:.4s }
+  @keyframes blink { 0%,70%,100%{opacity:.25} 35%{opacity:1} }
+
+  form { display: flex; gap: 10px; padding: 16px 22px 20px; border-top: 1px solid var(--border); background: var(--panel); }
+  #q { flex: 1; background: var(--chip); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: 10px; font-size: 14px; outline: none; }
+  #q:focus { border-color: var(--accent); }
+  button.send { background: var(--accent); border: none; color: #fff; padding: 0 22px; border-radius: 10px; font-size: 14px; cursor: pointer; }
+  button.send:disabled { opacity: .45; cursor: default; }
+
+  /* ---- QR modal ---- */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(5,7,12,.72); display: none; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 26px; max-width: 360px; width: 100%; text-align: center; }
+  .modal h3 { margin-bottom: 6px; font-size: 16px; }
+  .modal p { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 16px; }
+  .modal img.qr { width: 240px; height: 240px; image-rendering: pixelated; background: #fff; border-radius: 12px; padding: 10px; display: block; margin: 0 auto 14px; }
+  .modal .url-row { display: flex; gap: 8px; justify-content: center; margin-bottom: 8px; }
+  .modal input.url { flex: 1; background: var(--chip); border: 1px solid var(--border); color: var(--muted); padding: 9px 12px; border-radius: 8px; font-size: 12px; }
+  .modal button.copy, .modal button.close { background: var(--chip); border: 1px solid var(--border); color: var(--text); padding: 9px 14px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+  .modal button.close { margin-top: 10px; }
+
+  @media (max-width: 760px) {
+    aside { position: fixed; z-index: 40; top: 53px; bottom: 0; left: 0; transform: translateX(-100%); transition: transform .2s ease; box-shadow: 8px 0 24px rgba(0,0,0,.4); width: min(320px, 85vw); }
+    aside.open { transform: translateX(0); }
+    #messages { padding: 18px 14px; }
+    .msg { max-width: 92%; }
+    form { padding: 12px 14px 16px; }
+    header h1 { font-size: 15px; }
+    .badge.hide-sm { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <button class="icon-btn" id="menuBtn" title="Documents" aria-label="Toggle documents panel">📄</button>
+  <h1>PDF RAG Chatbot</h1>
+  <span class="badge ok hide-sm" id="modeBadge">no login needed</span>
+  <span class="spacer"></span>
+  <span class="badge" id="healthBadge">checking…</span>
+  <button class="icon-btn" id="shareBtn" title="Share / QR code">🔗</button>
+</header>
+
+<div class="layout">
+  <aside id="sidebar">
+    <h2>Documents</h2>
+    <div id="uploadArea">
+      <div id="dropzone">Drop PDFs here<br>or click to browse</div>
+      <input type="file" id="fileInput" accept=".pdf" multiple hidden>
+    </div>
+    <div id="readOnlyNote" style="display:none" class="empty-note">
+      ℹ️ This is a read-only demo — the knowledge base below is pre-indexed.
+      Run the project locally to add your own PDFs.
+    </div>
+    <div id="docList"><div class="empty-note">No documents indexed yet.</div></div>
+  </aside>
+
+  <main class="chat">
+    <div id="messages">
+      <div class="msg bot">👋 Ask anything about the indexed documents.
+Answers come <b>only from the documents</b> and include page-level citations like <b>[1]</b>.
+No signup or login needed — just type.</div>
+    </div>
+    <form id="askForm">
+      <input id="q" placeholder="Ask a question about your documents…" autocomplete="off">
+      <button class="send" type="submit">Send</button>
+    </form>
+  </main>
+</div>
+
+<div class="modal-backdrop" id="qrModal">
+  <div class="modal">
+    <h3>Share this chatbot</h3>
+    <p>Scan to open the chat on your phone.<br>No app, no account — it opens straight into the conversation.</p>
+    <img class="qr" id="qrImg" alt="QR code linking to this chatbot">
+    <div class="url-row">
+      <input class="url" id="urlBox" readonly>
+      <button class="copy" id="copyBtn">Copy</button>
+    </div>
+    <button class="close" id="closeModal">Close</button>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const messages = $('#messages');
+
+function addMsg(cls, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.textContent = text;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+  return div;
+}
+
+let UPLOADS_ENABLED = false;
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    const b = $('#healthBadge');
+    if (d.llm_ready) b.textContent = `AI: ${d.llm_model}`;
+    else b.textContent = `${(d.llm_backend || 'llm')} offline`;
+    b.className = 'badge ' + (d.llm_ready ? 'ok' : 'bad');
+    $('#chunkBadge') && ($('#chunkBadge').textContent =
+      `${d.chunks_indexed} chunks · ${d.embedding_model || ''}`);
+
+    // read-only mode: hide uploader, show note
+    UPLOADS_ENABLED = !!d.uploads_enabled;
+    $('#uploadArea').style.display = UPLOADS_ENABLED ? '' : 'none';
+    $('#readOnlyNote').style.display = UPLOADS_ENABLED ? 'none' : '';
+  } catch {
+    $('#healthBadge').textContent = 'API unreachable';
+    $('#healthBadge').className = 'badge bad';
+  }
+}
+
+async function loadDocs() {
+  try {
+    const r = await fetch('/api/documents');
+    const { documents } = await r.json();
+    const list = $('#docList');
+    list.innerHTML = '';
+    if (!documents.length) {
+      list.innerHTML = '<div class="empty-note">No documents indexed yet.</div>';
+      return;
+    }
+    for (const d of documents) {
+      const el = document.createElement('div');
+      el.className = 'doc';
+      el.innerHTML = `<div class="meta"><span class="name" title="${d.source}">${d.source}</span>
+        <span class="sub">${d.chunks} chunks${d.last_page ? ' · ' + d.last_page + ' pages' : ''}</span></div>`
+        + (UPLOADS_ENABLED ? '<button title="Delete">✕</button>' : '');
+      el.innerHTML = el.innerHTML; // normalize
+      const btn = el.querySelector('button');
+      if (btn) btn.onclick = async () => {
+        await fetch('/api/documents/' + d.doc_id, { method: 'DELETE' });
+        loadDocs(); checkHealth();
+      };
+      list.appendChild(el);
+    }
+  } catch (e) { /* serverless cold start; retried by interval */ }
+}
+
+// --- mobile sidebar ----------------------------------------------------
+$('#menuBtn').onclick = () => $('#sidebar').classList.toggle('open');
+
+// --- upload (local mode only) ------------------------------------------
+const dz = $('#dropzone'), fi = $('#fileInput');
+if (dz) {
+  dz.onclick = () => fi.click();
+  fi.onchange = () => upload(fi.files);
+  dz.ondragover = e => { e.preventDefault(); dz.classList.add('drag'); };
+  dz.ondragleave = () => dz.classList.remove('drag');
+  dz.ondrop = e => { e.preventDefault(); dz.classList.remove('drag'); upload(e.dataTransfer.files); };
+}
+
+async function upload(files) {
+  if (!files || !files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  const note = addMsg('bot', `⏳ Ingesting ${files.length} file(s)…`);
+  try {
+    const r = await fetch('/api/documents', { method: 'POST', body: fd });
+    const d = await r.json();
+    note.remove();
+    for (const res of d.ingested || []) {
+      if (res.ok) addMsg('bot', `✅ Indexed “${res.filename}” — ${res.num_pages} pages → ${res.num_chunks} chunks.`);
+      else addMsg('bot error', `⚠️ ${res.filename}: ${res.error}`);
+    }
+    loadDocs(); checkHealth();
+  } catch (e) { note.textContent = '❌ Upload failed: ' + e.message; }
+}
+
+// --- ask ----------------------------------------------------------------
+let busy = false;
+$('#askForm').onsubmit = async e => {
+  e.preventDefault();
+  if (busy) return;
+  const q = $('#q').value.trim();
+  if (!q) return;
+  $('#q').value = '';
+  addMsg('user', q);
+  busy = true;
+  $('.send').disabled = true;
+  const typing = document.createElement('div');
+  typing.className = 'msg bot';
+  typing.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  messages.appendChild(typing); messages.scrollTop = messages.scrollHeight;
+
+  try {
+    const r = await fetch('/api/ask', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ question: q })
+    });
+    const d = await r.json();
+    typing.remove();
+    if (!r.ok) { addMsg('bot error', d.detail || 'Request failed'); return; }
+    renderAnswer(d);
+  } catch (e) {
+    typing.remove();
+    addMsg('bot error', 'Network error: ' + e.message);
+  } finally {
+    busy = false; $('.send').disabled = false; $('#q').focus();
+  }
+};
+
+function renderAnswer(d) {
+  const div = document.createElement('div');
+  div.className = 'msg bot';
+  div.textContent = d.answer;
+  const chips = document.createElement('div');
+  chips.className = 'cite-chips';
+  (d.citations || []).forEach(c => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.textContent = `[${c.ref}] ${c.source} · ${c.pages}` + (c.auto ? ' · auto' : '');
+    chip.onclick = () => toggleSource(div, c.ref, d.sources);
+    chips.appendChild(chip);
+  });
+  if (d.timing) {
+    const t = document.createElement('span');
+    t.style.cssText = 'font-size:11px;color:var(--muted)';
+    t.textContent = `  · retrieval ${d.timing.retrieval_ms}ms · llm ${d.timing.generation_ms}ms`;
+    chips.appendChild(t);
+  }
+  div.appendChild(chips);
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function toggleSource(container, ref, sources) {
+  let box = container.querySelector('.src-box[data-ref="' + ref + '"]');
+  if (box) { box.remove(); return; }
+  const src = (sources || [])[ref - 1];
+  if (!src) return;
+  box = document.createElement('div');
+  box.className = 'src-box';
+  box.dataset.ref = ref;
+  box.textContent = `[${ref}] ${src.source}, pp.${src.page_start}-${src.page_end} (score ${src.score})\n\n${src.text}`;
+  container.appendChild(box);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+// --- share / QR ----------------------------------------------------------
+$('#shareBtn').onclick = () => {
+  const url = location.origin + '/';
+  $('#urlBox').value = url;
+  $('#qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=0&data=' +
+    encodeURIComponent(url);
+  $('#qrModal').classList.add('open');
+};
+$('#closeModal').onclick = () => $('#qrModal').classList.remove('open');
+$('#qrModal').onclick = e => { if (e.target === $('#qrModal')) $('#qrModal').classList.remove('open'); };
+$('#copyBtn').onclick = async () => {
+  try { await navigator.clipboard.writeText($('#urlBox').value); $('#copyBtn').textContent = 'Copied!'; }
+  catch { $('#urlBox').select(); document.execCommand('copy'); $('#copyBtn').textContent = 'Copied!'; }
+  setTimeout(() => $('#copyBtn').textContent = 'Copy', 1500);
+};
+
+checkHealth().then(loadDocs);
+setInterval(checkHealth, 20000);
+</script>
+</body>
+</html>

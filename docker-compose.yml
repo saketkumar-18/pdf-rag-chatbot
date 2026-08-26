@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  pdf-rag:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/data/chroma
+      - ollama-models:/data/ollama
+      - uploads:/data/uploads
+    environment:
+      - RAG_LLM_MODEL=llama3.2:1b
+      - RAG_TOP_K=5
+      - RAG_MAX_UPLOAD_MB=50
+    restart: unless-stopped
+
+volumes:
+  chroma-data:
+  ollama-models:
+  uploads:

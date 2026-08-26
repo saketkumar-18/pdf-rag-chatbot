@@ -1,0 +1,16 @@
+.venv/
+.git/
+.vercel/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+data/chroma/
+data/uploads/
+data/demo/
+scripts/
+qr/
+.env
+.env.*
+*.md
+!README.md
