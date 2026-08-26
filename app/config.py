@@ -129,6 +129,14 @@ CHUNK_SIZE = _env_int("RAG_CHUNK_SIZE", "900")        # characters
 CHUNK_OVERLAP = _env_int("RAG_CHUNK_OVERLAP", "150")  # characters
 TOP_K = _env_int("RAG_TOP_K", "5")                    # chunks per query
 
+# --- agentic RAG (LangGraph) ----------------------------------------------
+# AGENT_MODE: auto = use the LangGraph agent when an LLM backend is present,
+#             on   = force agent (falls back to classic path if unavailable),
+#             off  = classic single-shot RAG only.
+AGENT_MODE = os.getenv("RAG_AGENT_MODE", "auto").strip().lower()
+AGENT_MAX_REWRITES = _env_int("RAG_AGENT_MAX_REWRITES", "1")
+AGENT_CHECK_ANSWER = _env_bool("RAG_AGENT_CHECK_ANSWER", "true")
+
 # --- upload limits ---------------------------------------------------------
 MAX_UPLOAD_MB = _env_int("RAG_MAX_UPLOAD_MB", "50")
 ALLOWED_EXTENSIONS = {".pdf"}

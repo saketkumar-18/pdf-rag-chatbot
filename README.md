@@ -5,6 +5,11 @@
 Upload PDFs → ask questions → get answers **cited to page numbers**, generated
 strictly from your documents. Fully local: no API keys, no cloud.
 
+Now with an **agentic mode** built on **LangGraph**: a self-correcting CRAG
+pipeline that grades what it retrieves, rewrites weak queries, and checks its
+own draft for hallucinations before replying — with a visible step-by-step
+trace in the UI.
+
 ```
 PDF ──pypdf──► page-aware chunks ──MiniLM──► vectors ──► ChromaDB
                                                             │
@@ -17,6 +22,36 @@ Question ──MiniLM──► vector search (top-k) ─────────
                  Ollama LLM (llama3.2)  ──►  cited answer [1][2]
 ```
 
+### Agentic mode (LangGraph)
+
+```
+        ┌──────────────────────────────────────────────────────────┐
+        │                                                          │
+START ─► retrieve ─► grade_documents ─┬─ relevant ─► generate ─► check_answer ─► END
+                                      │                            │ hallucinated?
+                                      ├─ irrelevant & retries left ─► rewrite_query ─┐
+                                      │                                              │
+                                      └─ irrelevant & exhausted ─► refuse (no LLM)   │
+                                                                                     │
+        rewrite_query ─► retrieve (loop)                        generate ◄───────────┘
+                                                                  (strict mode, 1 retry)
+```
+
+- **retrieve** — vector search (original or rewritten query)
+- **grade_documents** — one batched LLM call scores every chunk yes/no;
+  unparseable replies fall back to a similarity-floor heuristic
+- **rewrite_query** — LLM rewrites the question into a keyword-rich query,
+  then retrieval runs again (max `RAG_AGENT_MAX_REWRITES`)
+- **generate** — cited answer from the surviving chunks only
+- **check_answer** — a grader LLM rejects drafts that invent facts; one
+  strict-mode regeneration is allowed before giving up
+- Every node appends to a **trace** shown in the UI (🤖 Agent panel)
+
+Toggle it per-question with the **🤖 Agent** switch in the header, or
+globally with `RAG_AGENT_MODE=auto|on|off`. When no LLM backend is
+configured the agent reports itself unavailable and the classic
+single-shot path serves answers — nothing breaks.
+
 ## Stack
 
 | Layer | Choice | Why |
@@ -27,6 +62,7 @@ Question ──MiniLM──► vector search (top-k) ─────────
 | Embeddings | `all-MiniLM-L6-v2` (sentence-transformers) | 384-dim, fast on CPU |
 | Vector DB | ChromaDB (persistent, cosine HNSW) | zero-setup local persistence |
 | LLM | Ollama · `llama3.2:1b` default | open-source weights, swap via env var |
+| Agent orchestration | **LangGraph** (CRAG graph) | retrieve→grade→rewrite→generate→check with cycles |
 
 ## Deployment modes
 
@@ -95,7 +131,7 @@ Open **http://localhost:8000** — drop a PDF in the sidebar, ask questions.
 | `GET /api/documents` | list indexed documents |
 | `DELETE /api/documents/{doc_id}` | remove document from index |
 | `POST /api/search` | raw vector search, returns chunks + scores |
-| `POST /api/ask` | RAG answer with `citations[]` and `sources[]` |
+| `POST /api/ask` | RAG answer with `citations[]` and `sources[]`; optional `"agent": true/false` |
 
 Interactive docs: http://localhost:8000/docs
 
@@ -119,6 +155,31 @@ curl -X POST localhost:8000/api/ask -H "Content-Type: application/json" \
 `auto: true` means the model omitted inline `[n]` markers and the backend
 attached provenance automatically.
 
+When the agentic path runs, the response additionally carries an `agent`
+block:
+
+```json
+{
+  "agent": {
+    "enabled": true,
+    "trace": [
+      {"node": "retrieve", "detail": "5 chunks for \"…\", best score 0.48", "ms": 44},
+      {"node": "grade",    "detail": "kept 2/5 chunks", "ms": 1200},
+      {"node": "generate", "detail": "118 chars from 2 chunks", "ms": 6800},
+      {"node": "check",    "detail": "grounded ✓", "ms": 4900}
+    ],
+    "rewrites": 0,
+    "retries": 0,
+    "verdict": "grounded",
+    "total_ms": 13000
+  }
+}
+```
+
+`verdict` is `grounded` (passed the hallucination check), `ungrounded`
+(rejected twice — answer still returned, treat with care), or `skipped`
+(honest refusal, no generation LLM call was made).
+
 ## Configuration (`.env`, see `.env.example`)
 
 | Variable | Default | Meaning |
@@ -131,6 +192,9 @@ attached provenance automatically.
 | `RAG_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | 900 / 150 | chunking knobs |
 | `RAG_TOP_K` | 5 | chunks retrieved per query |
+| `RAG_AGENT_MODE` | `auto` | `auto` / `on` / `off` — LangGraph agentic path |
+| `RAG_AGENT_MAX_REWRITES` | 1 | query rewrites allowed when retrieval is irrelevant |
+| `RAG_AGENT_CHECK_ANSWER` | `true` | extra LLM call that screens drafts for hallucinations |
 | `RAG_MAX_UPLOAD_MB` | 50 | upload limit |
 
 ## Hugging Face: LLM + embeddings backend (not hosting)
@@ -167,7 +231,9 @@ experimental Docker Space image for PRO users.
 ```
 
 Covers: page-aware chunking, overlap behavior, store round-trip +
-re-upload dedup, delete, and a full API flow including a live LLM answer.
+re-upload dedup, delete, a full API flow including a live LLM answer,
+and the LangGraph agent (happy path, rewrite loop, refusal, self-correction,
+grading fallbacks, API integration — LLM mocked, no network needed).
 
 ## Known limits
 

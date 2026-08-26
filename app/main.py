@@ -54,6 +54,7 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=10)
     doc_id: str | None = None
+    agent: bool | None = None  # None = server decides (RAG_AGENT_MODE)
 
 
 class Citation(BaseModel):
@@ -144,6 +145,40 @@ def _parse_citations(answer: str, hits: list[dict]) -> tuple[str, list[Citation]
     return answer, [make_citation(n, auto=True) for n in auto_hits]
 
 
+def _agent_response(result: dict, t0: float) -> dict:
+    """Shape a LangGraph agent result into the standard /api/ask contract."""
+    hits = result["cited_hits"] or result["all_hits"]
+    answer, citations = _parse_citations(result["answer"], hits)
+    total_ms = int((time.perf_counter() - t0) * 1000)
+    return {
+        "answer": answer,
+        "citations": [c.model_dump() for c in citations],
+        "sources": [
+            {
+                "text": h["text"],
+                "source": h["metadata"]["source"],
+                "page_start": h["metadata"]["page_start"],
+                "page_end": h["metadata"]["page_end"],
+                "score": h["score"],
+            }
+            for h in hits
+        ],
+        "timing": {
+            "retrieval_ms": sum(s["ms"] for s in result["trace"] if s["node"] == "retrieve"),
+            "generation_ms": sum(s["ms"] for s in result["trace"] if s["node"] == "generate"),
+            "best_similarity": hits[0]["score"] if hits else 0.0,
+        },
+        "agent": {
+            "enabled": True,
+            "trace": result["trace"],
+            "rewrites": result["rewrites"],
+            "retries": result["retries"],
+            "verdict": result["verdict"],
+            "total_ms": total_ms,
+        },
+    }
+
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
@@ -169,6 +204,8 @@ def _health_embed_label() -> str:
 
 @app.get("/api/health")
 def health():
+    from . import agent
+
     try:
         chunks = store.count_chunks()
     except FileNotFoundError:
@@ -182,6 +219,11 @@ def health():
             "chunks_indexed": 0,
             "deployment": config.DEPLOYMENT,
             "uploads_enabled": False,
+            "agent": {
+                "mode": config.AGENT_MODE,
+                "available": agent.available(),
+                "langgraph": agent.LANGGRAPH_VERSION,
+            },
         }
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, f"Vector store unavailable: {exc}") from exc
@@ -194,6 +236,11 @@ def health():
         "chunks_indexed": chunks,
         "deployment": config.DEPLOYMENT,
         "uploads_enabled": not config.SERVERLESS,
+        "agent": {
+            "mode": config.AGENT_MODE,
+            "available": agent.available(),
+            "langgraph": agent.LANGGRAPH_VERSION,
+        },
     }
 
 
@@ -283,6 +330,26 @@ def ask(request: Request, req: AskRequest):
     _rate_limit(request, "ask")
     t0 = time.perf_counter()
 
+    # ---- Agentic path (LangGraph CRAG) -----------------------------------
+    from . import agent
+
+    if agent.resolve_mode(req.agent):
+        try:
+            result = agent.run_agent(req.question, top_k=req.top_k, doc_id=req.doc_id)
+        except agent.AgentUnavailable:
+            result = None  # fall through to the classic path below
+        except llm.LLMError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except FileNotFoundError:
+            raise HTTPException(
+                503,
+                "The knowledge index is not available on this deployment yet. "
+                "The site owner needs to bundle data/index.json (see README).",
+            )
+        if result is not None:
+            return _agent_response(result, t0)
+
+    # ---- Classic single-shot path ----------------------------------------
     where = {"doc_id": {"$eq": req.doc_id}} if req.doc_id else None
     try:
         hits = store.search(req.question, k=req.top_k, where=where)

@@ -6,3 +6,5 @@ python-multipart>=0.0.9
 sentence-transformers>=3.0
 torch>=2.1
 python-dotenv>=1.0
+langgraph>=1.0
+langchain-core>=1.0

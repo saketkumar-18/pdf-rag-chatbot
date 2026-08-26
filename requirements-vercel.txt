@@ -8,3 +8,7 @@ pydantic>=2.7
 python-multipart>=0.0.9
 pypdf>=4.0
 python-dotenv>=1.0
+# Agentic RAG (LangGraph orchestrates the CRAG loop; LLM calls still go
+# through the stdlib HTTP client in app/llm.py — no langchain-openai needed).
+langgraph>=1.0
+langchain-core>=1.0
