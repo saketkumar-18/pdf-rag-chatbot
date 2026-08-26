@@ -5,10 +5,11 @@
 Upload PDFs → ask questions → get answers **cited to page numbers**, generated
 strictly from your documents. Fully local: no API keys, no cloud.
 
-Now with an **agentic mode** built on **LangGraph**: a self-correcting CRAG
-pipeline that grades what it retrieves, rewrites weak queries, and checks its
-own draft for hallucinations before replying — with a visible step-by-step
-trace in the UI.
+Now with **two LangGraph agent modes**: a self-correcting **CRAG pipeline**
+(grades what it retrieves, rewrites weak queries, checks its own draft for
+hallucinations) and a **deep-research mode** (decomposes the question into
+sub-queries, retrieves for each, synthesizes one cited answer) — both with a
+visible step-by-step trace in the UI.
 
 ```
 PDF ──pypdf──► page-aware chunks ──MiniLM──► vectors ──► ChromaDB
@@ -47,10 +48,31 @@ START ─► retrieve ─► grade_documents ─┬─ relevant ─► generate 
   strict-mode regeneration is allowed before giving up
 - Every node appends to a **trace** shown in the UI (🤖 Agent panel)
 
-Toggle it per-question with the **🤖 Agent** switch in the header, or
-globally with `RAG_AGENT_MODE=auto|on|off`. When no LLM backend is
-configured the agent reports itself unavailable and the classic
-single-shot path serves answers — nothing breaks.
+Pick a mode per-question with the header picker (**Classic / 🤖 Agent /
+🔬 Research**), or globally with `RAG_AGENT_MODE=auto|on|off`. When no LLM
+backend is configured the agents report themselves unavailable and the
+classic single-shot path serves answers — nothing breaks.
+
+### Deep-research mode (LangGraph)
+
+```
+START ─► plan ─► research ─► synthesize ─► check_answer ─► END
+              (N sub-queries,   (1 LLM call,    │ hallucinated?
+               dedupe + rank)    cited answer)  ▼
+                              synthesize ◄── retry_gate (strict mode, 1 retry)
+```
+
+- **plan** — one LLM call decomposes the question into ≤ `RAG_RESEARCH_MAX_SUBQUERIES`
+  keyword-rich sub-questions; unparseable replies fall back to the original question
+- **research** — one vector search per sub-query (no LLM); results are deduped
+  by chunk id, ranked by score, and capped at `RAG_RESEARCH_MAX_FINDINGS`
+- **synthesize** — cited answer composed from the union of findings; if nothing
+  was found it refuses without spending an LLM call
+- **check_answer** — same hallucination grader as the CRAG graph, with one
+  strict-mode regeneration allowed
+
+Bounded by design: a full run is typically **3 LLM calls + N cheap vector
+searches**, so it fits comfortably inside serverless timeouts.
 
 ## Stack
 
@@ -62,7 +84,7 @@ single-shot path serves answers — nothing breaks.
 | Embeddings | `all-MiniLM-L6-v2` (sentence-transformers) | 384-dim, fast on CPU |
 | Vector DB | ChromaDB (persistent, cosine HNSW) | zero-setup local persistence |
 | LLM | Ollama · `llama3.2:1b` default | open-source weights, swap via env var |
-| Agent orchestration | **LangGraph** (CRAG graph) | retrieve→grade→rewrite→generate→check with cycles |
+| Agent orchestration | **LangGraph** (2 graphs) | CRAG: retrieve→grade→rewrite→generate→check · Research: plan→multi-query→synthesize→check |
 
 ## Deployment modes
 
@@ -131,7 +153,7 @@ Open **http://localhost:8000** — drop a PDF in the sidebar, ask questions.
 | `GET /api/documents` | list indexed documents |
 | `DELETE /api/documents/{doc_id}` | remove document from index |
 | `POST /api/search` | raw vector search, returns chunks + scores |
-| `POST /api/ask` | RAG answer with `citations[]` and `sources[]`; optional `"agent": true/false` |
+| `POST /api/ask` | RAG answer with `citations[]` and `sources[]`; optional `"mode": "classic"\|"agent"\|"research"` (legacy `"agent": true/false` still works) |
 
 Interactive docs: http://localhost:8000/docs
 
@@ -155,13 +177,14 @@ curl -X POST localhost:8000/api/ask -H "Content-Type: application/json" \
 `auto: true` means the model omitted inline `[n]` markers and the backend
 attached provenance automatically.
 
-When the agentic path runs, the response additionally carries an `agent`
+When an agentic path runs, the response additionally carries an `agent`
 block:
 
 ```json
 {
   "agent": {
     "enabled": true,
+    "mode": "agent",
     "trace": [
       {"node": "retrieve", "detail": "5 chunks for \"…\", best score 0.48", "ms": 44},
       {"node": "grade",    "detail": "kept 2/5 chunks", "ms": 1200},
@@ -171,10 +194,14 @@ block:
     "rewrites": 0,
     "retries": 0,
     "verdict": "grounded",
+    "subqueries": [],
     "total_ms": 13000
   }
 }
 ```
+
+In `"mode": "research"` the trace instead shows `plan → research →
+synthesize → check`, and `subqueries` lists the planner's decomposition.
 
 `verdict` is `grounded` (passed the hallucination check), `ungrounded`
 (rejected twice — answer still returned, treat with care), or `skipped`
@@ -195,6 +222,9 @@ block:
 | `RAG_AGENT_MODE` | `auto` | `auto` / `on` / `off` — LangGraph agentic path |
 | `RAG_AGENT_MAX_REWRITES` | 1 | query rewrites allowed when retrieval is irrelevant |
 | `RAG_AGENT_CHECK_ANSWER` | `true` | extra LLM call that screens drafts for hallucinations |
+| `RAG_RESEARCH_MAX_SUBQUERIES` | 3 | max sub-questions the research planner may emit |
+| `RAG_RESEARCH_K_PER_SUBQUERY` | 3 | vector hits fetched per sub-query |
+| `RAG_RESEARCH_MAX_FINDINGS` | 8 | cap on unique chunks passed to synthesis |
 | `RAG_MAX_UPLOAD_MB` | 50 | upload limit |
 
 ## Hugging Face: LLM + embeddings backend (not hosting)
@@ -232,8 +262,10 @@ experimental Docker Space image for PRO users.
 
 Covers: page-aware chunking, overlap behavior, store round-trip +
 re-upload dedup, delete, a full API flow including a live LLM answer,
-and the LangGraph agent (happy path, rewrite loop, refusal, self-correction,
-grading fallbacks, API integration — LLM mocked, no network needed).
+and both LangGraph graphs — CRAG (happy path, rewrite loop, refusal,
+self-correction, grading fallbacks) and deep-research (plan fallback,
+dedupe/cap, no-findings refusal, self-correction, API integration) —
+LLM mocked, no network needed.
 
 ## Known limits
 

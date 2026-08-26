@@ -137,6 +137,13 @@ AGENT_MODE = os.getenv("RAG_AGENT_MODE", "auto").strip().lower()
 AGENT_MAX_REWRITES = _env_int("RAG_AGENT_MAX_REWRITES", "1")
 AGENT_CHECK_ANSWER = _env_bool("RAG_AGENT_CHECK_ANSWER", "true")
 
+# Deep-research mode (plan -> parallel subquery retrieval -> synthesize).
+# Bounded so a full run stays within serverless timeouts:
+# typical = 3 LLM calls (plan, synthesize, check) + N cheap vector searches.
+RESEARCH_MAX_SUBQUERIES = _env_int("RAG_RESEARCH_MAX_SUBQUERIES", "3")
+RESEARCH_K_PER_SUBQUERY = _env_int("RAG_RESEARCH_K_PER_SUBQUERY", "3")
+RESEARCH_MAX_FINDINGS = _env_int("RAG_RESEARCH_MAX_FINDINGS", "8")
+
 # --- upload limits ---------------------------------------------------------
 MAX_UPLOAD_MB = _env_int("RAG_MAX_UPLOAD_MB", "50")
 ALLOWED_EXTENSIONS = {".pdf"}

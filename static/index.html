@@ -60,9 +60,12 @@
   .agent-trace .step { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: baseline; }
   .agent-trace .step .node { color: var(--accent); font-weight: 600; min-width: 64px; font-family: ui-monospace, monospace; font-size: 11px; }
   .agent-trace .step .ms { margin-left: auto; font-size: 10.5px; opacity: .7; white-space: nowrap; }
-  .agent-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; padding: 0 4px; }
-  .agent-toggle input { accent-color: var(--accent2); cursor: pointer; }
-  .agent-toggle.on { color: var(--accent2); }
+  .mode-picker { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .mode-picker button { background: none; border: none; color: var(--muted); font-size: 11.5px; padding: 5px 10px; cursor: pointer; font-family: inherit; border-right: 1px solid var(--border); }
+  .mode-picker button:last-child { border-right: none; }
+  .mode-picker button:hover { color: var(--text); }
+  .mode-picker button.active { background: var(--accent2); color: #fff; }
+  .mode-picker button:disabled { opacity: .4; cursor: not-allowed; }
   .typing { display: inline-flex; gap: 5px; padding: 6px 2px; }
   .typing span { width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1.2s infinite; }
   .typing span:nth-child(2){ animation-delay:.2s } .typing span:nth-child(3){ animation-delay:.4s }
@@ -102,9 +105,11 @@
   <button class="icon-btn" id="menuBtn" title="Documents" aria-label="Toggle documents panel">📄</button>
   <h1>PDF RAG Chatbot</h1>
   <span class="badge ok hide-sm" id="modeBadge">no login needed</span>
-  <label class="agent-toggle hide-sm" id="agentToggle" title="Agentic RAG (LangGraph): grades retrieval, rewrites weak queries, self-checks for hallucinations">
-    <input type="checkbox" id="agentCheck"> 🤖 Agent
-  </label>
+  <div class="mode-picker hide-sm" id="modePicker" title="Answer mode: Classic = single-shot RAG · Agent = LangGraph CRAG (grades retrieval, self-checks) · Research = plan → multi-query retrieval → synthesize">
+    <button type="button" data-mode="classic">Classic</button>
+    <button type="button" data-mode="agent">🤖 Agent</button>
+    <button type="button" data-mode="research">🔬 Research</button>
+  </div>
   <span class="spacer"></span>
   <span class="badge" id="healthBadge">checking…</span>
   <button class="icon-btn" id="shareBtn" title="Share / QR code">🔗</button>
@@ -181,19 +186,20 @@ async function checkHealth() {
     $('#uploadArea').style.display = UPLOADS_ENABLED ? '' : 'none';
     $('#readOnlyNote').style.display = UPLOADS_ENABLED ? 'none' : '';
 
-    // agentic RAG toggle: enabled only when the backend reports it available
+    // mode picker: agent/research buttons enabled only when backend reports available
     const ag = d.agent || {};
-    const toggle = $('#agentToggle'), check = $('#agentCheck');
+    const picker = $('#modePicker');
     if (ag.available) {
-      toggle.style.display = '';
-      check.disabled = false;
-      if (!check.dataset.userSet) check.checked = true;  // default on when available
-      toggle.classList.toggle('on', check.checked);
-      toggle.title = `Agentic RAG (LangGraph ${ag.langgraph || ''}): grades retrieval, rewrites weak queries, self-checks answers`;
+      picker.style.display = '';
+      picker.querySelectorAll('button').forEach(b => b.disabled = false);
+      if (!CURRENT_MODE) setMode('agent');  // default to agent when available
+      picker.title = `LangGraph ${ag.langgraph || ''} — Agent: CRAG self-correction · Research: plan → multi-query → synthesize`;
     } else {
-      check.disabled = true; check.checked = false;
-      toggle.classList.remove('on');
-      toggle.title = 'Agent needs an LLM backend (currently in built-in retrieval mode)';
+      picker.querySelectorAll('button').forEach(b => {
+        b.disabled = b.dataset.mode !== 'classic';
+      });
+      setMode('classic');
+      picker.title = 'Agent/Research need an LLM backend (currently in built-in retrieval mode)';
     }
   } catch {
     $('#healthBadge').textContent = 'API unreachable';
@@ -231,11 +237,17 @@ async function loadDocs() {
 // --- mobile sidebar ----------------------------------------------------
 $('#menuBtn').onclick = () => $('#sidebar').classList.toggle('open');
 
-// --- agent toggle --------------------------------------------------------
-$('#agentCheck').onchange = e => {
-  e.target.dataset.userSet = '1';
-  $('#agentToggle').classList.toggle('on', e.target.checked);
-};
+// --- mode picker (classic / agent / research) ----------------------------
+let CURRENT_MODE = '';  // '' until health tells us what's available
+function setMode(mode) {
+  CURRENT_MODE = mode;
+  $('#modePicker').querySelectorAll('button').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === mode));
+}
+$('#modePicker').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-mode]');
+  if (btn && !btn.disabled) setMode(btn.dataset.mode);
+});
 
 // --- upload (local mode only) ------------------------------------------
 const dz = $('#dropzone'), fi = $('#fileInput');
@@ -281,12 +293,10 @@ $('#askForm').onsubmit = async e => {
   messages.appendChild(typing); messages.scrollTop = messages.scrollHeight;
 
   try {
-    const check = $('#agentCheck');
-    // checked -> force agent; unchecked -> force classic; disabled -> server decides
-    const agentFlag = check.disabled ? null : check.checked;
+    // Send the selected mode; '' (not yet known) lets the server decide.
     const r = await fetch('/api/ask', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ question: q, agent: agentFlag })
+      body: JSON.stringify({ question: q, mode: CURRENT_MODE || null })
     });
     const d = await r.json();
     typing.remove();
@@ -325,18 +335,34 @@ function renderAnswer(d) {
   messages.scrollTop = messages.scrollHeight;
 }
 
-const NODE_ICONS = { retrieve: '🔎', grade: '⚖️', rewrite: '✍️', generate: '💬', check: '✅', retry_gate: '🔁' };
+const NODE_ICONS = {
+  retrieve: '🔎', grade: '⚖️', rewrite: '✍️', generate: '💬', check: '✅', retry_gate: '🔁',
+  plan: '🧭', research: '🔎', synthesize: '🧵'
+};
 
 function renderTrace(ag) {
   const det = document.createElement('details');
   det.className = 'agent-trace';
   const n = (ag.trace || []).length;
+  const isResearch = ag.mode === 'research';
+  const label = isResearch ? '🔬 Research' : '🤖 Agent';
   const extras = [];
+  if (isResearch && (ag.subqueries || []).length) extras.push(`${ag.subqueries.length} subqueries`);
   if (ag.rewrites) extras.push(`${ag.rewrites} rewrite${ag.rewrites > 1 ? 's' : ''}`);
   if (ag.retries) extras.push(`${ag.retries} self-correction${ag.retries > 1 ? 's' : ''}`);
-  det.innerHTML = `<summary>🤖 Agent · ${n} steps${extras.length ? ' · ' + extras.join(' · ') : ''} · ${ag.total_ms}ms</summary>`;
+  det.innerHTML = `<summary>${label} · ${n} steps${extras.length ? ' · ' + extras.join(' · ') : ''} · ${ag.total_ms}ms</summary>`;
   const steps = document.createElement('div');
   steps.className = 'steps';
+  // research mode: show the plan decomposition first
+  if (isResearch && (ag.subqueries || []).length) {
+    const row = document.createElement('div');
+    row.className = 'step';
+    row.innerHTML = '<span class="node">🧭 plan</span>';
+    const detail = document.createElement('span');
+    detail.textContent = ag.subqueries.map((s, i) => `${i + 1}. ${s}`).join('  ·  ');
+    row.appendChild(detail);
+    steps.appendChild(row);
+  }
   (ag.trace || []).forEach(s => {
     const row = document.createElement('div');
     row.className = 'step';

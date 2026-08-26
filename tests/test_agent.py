@@ -38,20 +38,23 @@ def _fake_hits(n: int = 2, score: float = 0.6) -> list[dict]:
 class MockLLM:
     """Dispatches canned replies by prompt fingerprint; records every call."""
 
-    def __init__(self, grade_reply=None, check_reply="yes"):
+    def __init__(self, grade_reply=None, check_reply="yes", plan_reply=None):
         self.calls: list[str] = []
         self.grade_reply = grade_reply
         self.check_reply = check_reply
+        self.plan_reply = plan_reply
 
     def __call__(self, prompt: str, system: str | None = None, model: str | None = None) -> str:
         self.calls.append(prompt)
+        if "research planner" in prompt:
+            return self.plan_reply if self.plan_reply is not None else '["attention formula", "softmax normalization"]'
         if "relevance grader" in prompt:
             return self.grade_reply if self.grade_reply is not None else '["yes", "yes"]'
         if "Rewrite the question" in prompt:
             return "scaled dot-product attention formula softmax"
         if "answer quality grader" in prompt:
             return self.check_reply
-        # answer generation
+        # answer generation / synthesis
         return "The model uses scaled dot-product attention with softmax [1][2]."
 
 
@@ -245,6 +248,128 @@ def test_grade_fallback_on_garbage(patched):
 
 
 # ----------------------------------------------------------------------
+# Research graph: plan -> research -> synthesize -> check
+# ----------------------------------------------------------------------
+def test_parse_string_array():
+    from app.agent import _parse_string_array
+
+    assert _parse_string_array('["a", "b"]', 3) == ["a", "b"]
+    assert _parse_string_array('noise ["x","y","z"] noise', 2) == ["x", "y"]
+    # unquoted items tolerated
+    assert _parse_string_array("[GPU count, BLEU score]", 3) == ["GPU count", "BLEU score"]
+    assert _parse_string_array("no array", 3) == []
+
+
+def test_research_happy_path(patched):
+    from app import agent
+
+    result = agent.run_agent("Compare attention and normalization.", top_k=2, mode="research")
+    nodes = [s["node"] for s in result["trace"]]
+    assert nodes == ["plan", "research", "synthesize", "check"]
+    assert result["mode"] == "research"
+    assert result["subqueries"] == ["attention formula", "softmax normalization"]
+    assert result["verdict"] == "grounded"
+    assert result["retries"] == 0
+    assert "[1]" in result["answer"]
+    # 3 LLM calls: plan + synthesize + check (research node is pure retrieval)
+    assert len(patched.calls) == 3
+    # findings deduped: both subqueries return the same 2 fake hits
+    research_step = next(s for s in result["trace"] if s["node"] == "research")
+    assert "2 unique chunks" in research_step["detail"]
+
+
+def test_research_plan_fallback_on_garbage(patched):
+    from app import agent
+
+    patched.plan_reply = "Sorry, I cannot produce JSON."
+    result = agent.run_agent("question", top_k=2, mode="research")
+    assert result["subqueries"] == ["question"]  # original question reused
+    plan_step = next(s for s in result["trace"] if s["node"] == "plan")
+    assert "planner failed" in plan_step["detail"]
+    assert result["answer"]  # pipeline still completes
+
+
+def test_research_no_findings_refuses_without_llm(patched, monkeypatch):
+    from app import agent, store
+
+    monkeypatch.setattr(store, "search", lambda q, k=None, where=None: [])
+    result = agent.run_agent("unanswerable", top_k=2, mode="research")
+    nodes = [s["node"] for s in result["trace"]]
+    assert nodes == ["plan", "research", "synthesize", "check"]
+    assert "don't have enough information" in result["answer"]
+    assert result["verdict"] == "skipped"
+    # LLM used for plan + check only — never for synthesis
+    assert not any("Context blocks" in c for c in patched.calls)
+
+
+def test_research_self_correction(patched):
+    from app import agent, llm
+
+    check_replies = iter(["no", "yes"])
+    systems_seen: list[str] = []
+
+    def gen(prompt, system=None, model=None):
+        patched.calls.append(prompt)
+        if system:
+            systems_seen.append(system)
+        if "research planner" in prompt:
+            return '["sub q"]'
+        if "answer quality grader" in prompt:
+            return next(check_replies)
+        return "Draft synthesis [1]."
+
+    original = llm.generate
+    llm.generate = gen
+    try:
+        result = agent.run_agent("question", top_k=2, mode="research")
+    finally:
+        llm.generate = original
+
+    nodes = [s["node"] for s in result["trace"]]
+    assert nodes == [
+        "plan", "research", "synthesize", "check",
+        "retry_gate", "synthesize", "check",
+    ]
+    assert result["retries"] == 1
+    assert result["verdict"] == "grounded"
+    assert any("STRICT MODE" in s for s in systems_seen)
+
+
+def test_research_dedupe_and_cap(patched, monkeypatch):
+    from app import agent, store
+
+    monkeypatch.setattr(agent.config, "RESEARCH_MAX_SUBQUERIES", 3)
+    monkeypatch.setattr(agent.config, "RESEARCH_K_PER_SUBQUERY", 3)
+    monkeypatch.setattr(agent.config, "RESEARCH_MAX_FINDINGS", 4)
+
+    # each subquery returns 3 hits; one shared, rest unique -> union > cap
+    def search(q, k=None, where=None):
+        base = _fake_hits(1)  # shared hit doc_test_c0 in every result
+        extra = [
+            {
+                "id": f"uniq_{q[:4]}_{i}",
+                "text": f"unique chunk for {q} #{i}",
+                "metadata": {
+                    "source": "paper.pdf", "doc_id": "doc_test",
+                    "page_start": 1, "page_end": 1, "chunk_index": i,
+                },
+                "distance": 0.5, "score": 0.5 - i * 0.01,
+            }
+            for i in range(2)
+        ]
+        return base + extra
+
+    monkeypatch.setattr(store, "search", search)
+    result = agent.run_agent("question", top_k=2, mode="research")
+    findings = result["cited_hits"]
+    ids = [h["id"] for h in findings]
+    assert len(ids) == len(set(ids)), "findings must be deduped"
+    assert len(findings) <= 4, "findings must respect RESEARCH_MAX_FINDINGS"
+    scores = [h["score"] for h in findings]
+    assert scores == sorted(scores, reverse=True), "findings ranked by score"
+
+
+# ----------------------------------------------------------------------
 # API integration: /api/ask returns agent trace
 # ----------------------------------------------------------------------
 @pytest.fixture(scope="module")
@@ -286,5 +411,30 @@ def test_api_ask_agent_mode(isolated_storage_module, patched, monkeypatch):
 
     # explicit opt-out -> classic path, no agent block
     r2 = client.post("/api/ask", json={"question": "What attention is used?", "agent": False})
+    assert r2.status_code == 200
+    assert "agent" not in r2.json()
+
+
+def test_api_ask_research_mode(isolated_storage_module, patched, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.config as config
+    from app.main import app
+
+    monkeypatch.setattr(config, "AGENT_MODE", "auto")
+
+    client = TestClient(app)
+    r = client.post("/api/ask", json={"question": "Compare attention and normalization.", "mode": "research"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["agent"]["enabled"] is True
+    assert data["agent"]["mode"] == "research"
+    assert data["agent"]["subqueries"], "planner subqueries surfaced to the client"
+    nodes = [s["node"] for s in data["agent"]["trace"]]
+    assert nodes[0] == "plan" and "synthesize" in nodes
+    assert data["citations"]
+
+    # mode=classic forces the classic path even when agent is available
+    r2 = client.post("/api/ask", json={"question": "What attention is used?", "mode": "classic"})
     assert r2.status_code == 200
     assert "agent" not in r2.json()

@@ -67,6 +67,9 @@ class AgentState(TypedDict, total=False):
     rewrites: int
     retries: int
     verdict: str                # "grounded" | "ungrounded" | "skipped"
+    # research-mode fields
+    subqueries: list[str]       # plan decomposition of the question
+    findings: list[dict]        # deduped chunks gathered across subqueries
     # reducer: each node returns {"trace": [entry]} and entries accumulate
     trace: Annotated[list[dict], operator.add]
 
@@ -251,7 +254,7 @@ def node_check_answer(state: AgentState) -> dict:
     if not config.AGENT_CHECK_ANSWER:
         return {"verdict": "grounded", "trace": _trace_entry("check", "disabled by config", t0)}
 
-    context_hits = state.get("relevant") or state.get("hits") or []
+    context_hits = state.get("findings") or state.get("relevant") or state.get("hits") or []
     prompt = (
         "You are an answer quality grader. Decide whether the answer stays "
         "grounded in the context: it must not invent facts, numbers, or names "
@@ -273,6 +276,109 @@ def node_check_answer(state: AgentState) -> dict:
     return {
         "verdict": "grounded" if grounded else "ungrounded",
         "trace": _trace_entry("check", "grounded ✓" if grounded else "hallucination detected ✗", t0),
+    }
+
+
+# --------------------------------------------------------------------------
+# Deep-research nodes (plan → research → synthesize → check)
+# --------------------------------------------------------------------------
+_JSON_STR_ARRAY = re.compile(r"\[[^\]]*\]")
+
+
+def _parse_string_array(raw: str, max_items: int) -> list[str]:
+    """Parse a model reply like ["q1","q2"] into clean subquery strings."""
+    match = _JSON_STR_ARRAY.search(raw)
+    if not match:
+        return []
+    try:
+        arr = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        # tolerate unquoted items: [GPU count, BLEU score]
+        inner = match.group(0)[1:-1]
+        arr = [p.strip().strip("'\"") for p in inner.split(",")]
+    out = [str(x).strip() for x in arr if str(x).strip()]
+    return out[:max_items]
+
+
+def node_plan(state: AgentState) -> dict:
+    """Decompose the question into focused subqueries (1 LLM call)."""
+    t0 = time.perf_counter()
+    max_sub = config.RESEARCH_MAX_SUBQUERIES
+    prompt = (
+        "You are a research planner. Break the question below into at most "
+        f"{max_sub} focused sub-questions that a document search engine can "
+        "answer individually. Each sub-question must be short, concrete, and "
+        "keyword-rich. If the question is already simple, return it unchanged "
+        "as the only item.\n"
+        'Reply with ONLY a JSON array of strings, e.g. ["sub-q1","sub-q2"].\n\n'
+        f"Question: {state['question']}"
+    )
+    try:
+        raw = llm.generate(prompt, system="You output only valid JSON arrays.")
+        subs = _parse_string_array(raw, max_sub)
+    except llm.LLMError:
+        subs = []
+    if not subs:
+        subs = [state["question"]]
+        detail = f"planner failed → 1 subquery (original question)"
+    else:
+        detail = f"{len(subs)} subqueries: " + " · ".join(s[:40] for s in subs)
+    return {"subqueries": subs, "trace": _trace_entry("plan", detail, t0)}
+
+
+def node_research(state: AgentState) -> dict:
+    """Run one vector search per subquery; dedupe + rank the union (no LLM)."""
+    t0 = time.perf_counter()
+    where = {"doc_id": {"$eq": state["doc_id"]}} if state.get("doc_id") else None
+    k = config.RESEARCH_K_PER_SUBQUERY
+    seen: set[str] = set()
+    findings: list[dict] = []
+    per_sub: list[str] = []
+    for sub in state.get("subqueries") or [state["question"]]:
+        hits = store.search(sub, k=k, where=where)
+        fresh = 0
+        for h in hits:
+            if h["id"] not in seen:
+                seen.add(h["id"])
+                findings.append(h)
+                fresh += 1
+        per_sub.append(f"“{sub[:34]}”→{len(hits)} (+{fresh} new)")
+    findings.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+    findings = findings[: config.RESEARCH_MAX_FINDINGS]
+    detail = f"{len(findings)} unique chunks from {len(per_sub)} searches: " + "; ".join(per_sub)
+    return {"findings": findings, "trace": _trace_entry("research", detail, t0)}
+
+
+def node_synthesize(state: AgentState) -> dict:
+    """Compose the final cited answer from all gathered findings (1 LLM call)."""
+    t0 = time.perf_counter()
+    findings = state.get("findings") or []
+
+    if not findings:
+        answer = (
+            f"{_REFUSAL} in the uploaded documents to answer that. "
+            "Try rephrasing, or upload documents that cover the topic."
+        )
+        return {
+            "generation": answer,
+            "verdict": "skipped",
+            "trace": _trace_entry("synthesize", "refused: no findings (no LLM call)", t0),
+        }
+
+    system = prompts.SYSTEM_PROMPT
+    if state.get("strict"):
+        system += (
+            "\n6. STRICT MODE: a previous draft was rejected for inventing "
+            "facts. Every sentence MUST be supported by a context block and "
+            "carry an inline [n] citation. If unsure, refuse."
+        )
+    prompt = prompts.build_answer_prompt(state["question"], findings)
+    answer = llm.generate(prompt, system=system)
+    return {
+        "generation": answer,
+        "trace": _trace_entry(
+            "synthesize", f"{len(answer)} chars from {len(findings)} chunks", t0
+        ),
     }
 
 
@@ -338,6 +444,38 @@ def get_graph():
     return _graph
 
 
+_research_graph = None
+
+
+def get_research_graph():
+    """Compile the deep-research graph once, reuse forever.
+
+    plan ─► research ─► synthesize ─► check ─┬─ grounded/skipped ─► END
+                                             └─ ungrounded (1 retry) ─► synthesize (strict)
+    """
+    global _research_graph
+    if _research_graph is None:
+        if not LANGGRAPH_AVAILABLE:
+            raise AgentUnavailable("langgraph is not installed.")
+        builder = StateGraph(AgentState)
+        builder.add_node("plan", node_plan)
+        builder.add_node("research", node_research)
+        builder.add_node("synthesize", node_synthesize)
+        builder.add_node("check", node_check_answer)
+        builder.add_node("retry_gate", _enter_retry)
+
+        builder.add_edge(START, "plan")
+        builder.add_edge("plan", "research")
+        builder.add_edge("research", "synthesize")
+        builder.add_edge("synthesize", "check")
+        builder.add_conditional_edges(
+            "check", route_after_check, {"generate": "retry_gate", END: END}
+        )
+        builder.add_edge("retry_gate", "synthesize")
+        _research_graph = builder.compile()
+    return _research_graph
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
@@ -361,8 +499,17 @@ def resolve_mode(requested: bool | None) -> bool:
     return available()
 
 
-def run_agent(question: str, top_k: int = 5, doc_id: str | None = None) -> dict[str, Any]:
-    """Execute the full graph. Returns answer + trace + diagnostics."""
+def run_agent(
+    question: str,
+    top_k: int = 5,
+    doc_id: str | None = None,
+    mode: str = "agent",
+) -> dict[str, Any]:
+    """Execute a graph. Returns answer + trace + diagnostics.
+
+    mode="agent"    → CRAG self-correcting pipeline (retrieve→grade→generate→check)
+    mode="research" → deep-research pipeline (plan→research→synthesize→check)
+    """
     if not LANGGRAPH_AVAILABLE:
         raise AgentUnavailable("langgraph is not installed.")
     if config.effective_llm_backend() == "extractive":
@@ -378,16 +525,24 @@ def run_agent(question: str, top_k: int = 5, doc_id: str | None = None) -> dict[
         "strict": False,
         "trace": [],
     }
-    final_state = get_graph().invoke(initial)
 
-    relevant = final_state.get("relevant") or []
-    hits = final_state.get("hits") or []
+    if mode == "research":
+        final_state = get_research_graph().invoke(initial)
+        cited = final_state.get("findings") or []
+        all_hits = cited
+    else:
+        final_state = get_graph().invoke(initial)
+        cited = final_state.get("relevant") or []
+        all_hits = final_state.get("hits") or []
+
     return {
         "answer": final_state.get("generation", ""),
-        "cited_hits": relevant or hits,   # blocks the answer was built from
-        "all_hits": hits,
+        "cited_hits": cited or all_hits,  # blocks the answer was built from
+        "all_hits": all_hits,
         "trace": final_state.get("trace", []),
         "rewrites": final_state.get("rewrites", 0),
         "retries": final_state.get("retries", 0),
         "verdict": final_state.get("verdict", "grounded"),
+        "mode": mode,
+        "subqueries": final_state.get("subqueries", []),
     }

@@ -55,6 +55,7 @@ class AskRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=10)
     doc_id: str | None = None
     agent: bool | None = None  # None = server decides (RAG_AGENT_MODE)
+    mode: str | None = None    # "classic" | "agent" | "research" (overrides `agent`)
 
 
 class Citation(BaseModel):
@@ -170,10 +171,12 @@ def _agent_response(result: dict, t0: float) -> dict:
         },
         "agent": {
             "enabled": True,
+            "mode": result.get("mode", "agent"),
             "trace": result["trace"],
             "rewrites": result["rewrites"],
             "retries": result["retries"],
             "verdict": result["verdict"],
+            "subqueries": result.get("subqueries", []),
             "total_ms": total_ms,
         },
     }
@@ -330,12 +333,24 @@ def ask(request: Request, req: AskRequest):
     _rate_limit(request, "ask")
     t0 = time.perf_counter()
 
-    # ---- Agentic path (LangGraph CRAG) -----------------------------------
+    # ---- Agentic paths (LangGraph) ---------------------------------------
     from . import agent
 
-    if agent.resolve_mode(req.agent):
+    # Resolve which graph to run: explicit `mode` wins, then legacy `agent`
+    # bool, then the server default (RAG_AGENT_MODE).
+    graph_mode: str | None = None
+    if req.mode in {"agent", "research"}:
+        graph_mode = req.mode
+    elif req.mode == "classic":
+        graph_mode = None
+    elif agent.resolve_mode(req.agent):
+        graph_mode = "agent"
+
+    if graph_mode:
         try:
-            result = agent.run_agent(req.question, top_k=req.top_k, doc_id=req.doc_id)
+            result = agent.run_agent(
+                req.question, top_k=req.top_k, doc_id=req.doc_id, mode=graph_mode
+            )
         except agent.AgentUnavailable:
             result = None  # fall through to the classic path below
         except llm.LLMError as exc:
