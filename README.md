@@ -90,7 +90,8 @@ searches**, so it fits comfortably inside serverless timeouts.
 
 | | `local` (default) | `serverless` (Vercel) |
 |---|---|---|
-| Uploads | ✅ drop PDFs in the UI | ❌ read-only (prebuilt index) |
+| Uploads | ✅ drop PDFs in the UI | ❌ demo KB read-only (prebuilt index) |
+| **User uploads ("Your documents")** | ✅ browser-side indexing | ✅ browser-side indexing |
 | Vector store | ChromaDB on disk | bundled flat-file `data/index.json` |
 | Embeddings | sentence-transformers (torch) | fastembed (ONNX, bundled in repo) |
 | LLM | local Ollama | hosted API key **or built-in retrieval mode** |
@@ -99,6 +100,23 @@ searches**, so it fits comfortably inside serverless timeouts.
 **Zero-auth by design:** there is no signup or login anywhere. Anyone with the
 link (or a scan of the QR code — use the 🔗 button in the header) lands
 directly in the chat.
+
+## User uploads on the public site ("Your documents")
+
+Even on the read-only Vercel deployment, every visitor can add their own PDFs:
+
+1. The PDF is parsed **entirely in the browser** (pdf.js) — the file itself is
+   never uploaded anywhere.
+2. Extracted text chunks are sent to `POST /api/embed`, a server-side proxy to
+   the HF feature-extraction API (the HF token never reaches the client).
+3. Vectors are stored in the visitor's **IndexedDB** — private to that device,
+   persistent across visits, deletable from the sidebar.
+4. On each question the browser embeds the query, runs cosine search over the
+   local chunks, and sends its top-k hits to `/api/ask` as `contexts`; the
+   server generates the cited answer from them.
+
+Limits: 20 documents / 600 chunks per browser, 32 texts per embed batch
+(≤4000 chars each), 15 embed requests/min per IP.
 
 ## Deploy to Vercel (free)
 
@@ -153,7 +171,8 @@ Open **http://localhost:8000** — drop a PDF in the sidebar, ask questions.
 | `GET /api/documents` | list indexed documents |
 | `DELETE /api/documents/{doc_id}` | remove document from index |
 | `POST /api/search` | raw vector search, returns chunks + scores |
-| `POST /api/ask` | RAG answer with `citations[]` and `sources[]`; optional `"mode": "classic"\|"agent"\|"research"` (legacy `"agent": true/false` still works) |
+| `POST /api/embed` | embedding proxy for browser indexing (`{"texts": [...]}` → 384-dim vectors) |
+| `POST /api/ask` | RAG answer with `citations[]` and `sources[]`; optional `"mode": "classic"\|"agent"\|"research"` (legacy `"agent": true/false` still works); optional `"contexts": [...]` to answer from client-provided chunks |
 
 Interactive docs: http://localhost:8000/docs
 
