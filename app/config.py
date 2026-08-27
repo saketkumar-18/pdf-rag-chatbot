@@ -97,6 +97,13 @@ OPENAI_LLM_MODEL = os.getenv(
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
 HF_BASE_URL = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1").rstrip("/")
 HF_LLM_MODEL = os.getenv("RAG_HF_LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+# Server-side embedding proxy for browser-indexed uploads (keeps the token
+# off the client). Same all-MiniLM-L6-v2 space as every other backend.
+HF_EMBED_URL = os.getenv(
+    "RAG_HF_EMBED_URL",
+    "https://router.huggingface.co/hf-inference/models/"
+    "sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction",
+)
 
 
 def effective_llm_backend() -> str:
@@ -159,4 +166,5 @@ CORS_ORIGINS = [
 RATE_LIMIT_ASK = _env_int("RAG_RATE_LIMIT_ASK", "20")      # requests/min
 RATE_LIMIT_SEARCH = _env_int("RAG_RATE_LIMIT_SEARCH", "30")
 RATE_LIMIT_UPLOAD = _env_int("RAG_RATE_LIMIT_UPLOAD", "10")
+RATE_LIMIT_EMBED = _env_int("RAG_RATE_LIMIT_EMBED", "15")  # browser indexing batches
 RATE_LIMIT_ENABLED = _env_bool("RAG_RATE_LIMIT_ENABLED", "true")

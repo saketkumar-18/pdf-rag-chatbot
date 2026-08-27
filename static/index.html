@@ -31,8 +31,10 @@
   /* ---- sidebar ---- */
   aside { width: 300px; border-right: 1px solid var(--border); background: var(--panel); padding: 18px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
   aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-  #dropzone { border: 2px dashed var(--border); border-radius: 10px; padding: 22px 12px; text-align: center; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; font-size: 13px; }
-  #dropzone:hover, #dropzone.drag { border-color: var(--accent); background: rgba(79,140,255,.06); color: var(--text); }
+  #dropzone, #localDropzone { border: 2px dashed var(--border); border-radius: 10px; padding: 22px 12px; text-align: center; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; font-size: 13px; }
+  #dropzone:hover, #dropzone.drag, #localDropzone:hover, #localDropzone.drag { border-color: var(--accent); background: rgba(79,140,255,.06); color: var(--text); }
+  .section-note { color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-top: 8px; }
+  .doc .tag { font-size: 9.5px; padding: 1px 6px; border-radius: 8px; background: rgba(55,212,160,.12); color: var(--accent2); margin-left: 6px; vertical-align: 1px; white-space: nowrap; }
   #docList { display: flex; flex-direction: column; gap: 8px; }
   .doc { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; background: var(--chip); border-radius: 8px; font-size: 13px; }
   .doc .meta { min-width: 0; }
@@ -117,21 +119,32 @@
 
 <div class="layout">
   <aside id="sidebar">
-    <h2>Documents</h2>
+    <h2>Your documents</h2>
+    <div id="localUploadArea" style="display:none">
+      <div id="localDropzone">📤 Drop PDFs here<br>or click to browse</div>
+      <input type="file" id="localFileInput" accept=".pdf" multiple hidden>
+      <div class="section-note">Your PDF never leaves the browser — it is parsed here, and only the extracted text chunks are sent to be embedded. The index is stored privately on this device.</div>
+    </div>
+    <div id="localUnavailableNote" style="display:none" class="empty-note">
+      ℹ️ Adding your own PDFs is not available on this deployment.
+    </div>
+    <div id="localDocList"></div>
+
+    <h2 style="margin-top:6px">Demo knowledge base</h2>
     <div id="uploadArea">
       <div id="dropzone">Drop PDFs here<br>or click to browse</div>
       <input type="file" id="fileInput" accept=".pdf" multiple hidden>
     </div>
     <div id="readOnlyNote" style="display:none" class="empty-note">
-      ℹ️ This is a read-only demo — the knowledge base below is pre-indexed.
-      Run the project locally to add your own PDFs.
+      ℹ️ The demo knowledge base below is pre-indexed and read-only —
+      use “Your documents” above to add your own PDFs.
     </div>
     <div id="docList"><div class="empty-note">No documents indexed yet.</div></div>
   </aside>
 
   <main class="chat">
     <div id="messages">
-      <div class="msg bot">👋 Ask anything about the indexed documents.
+      <div class="msg bot">👋 Ask anything about the indexed documents — or add your own PDFs in the sidebar (“Your documents”).
 Answers come <b>only from the documents</b> and include page-level citations like <b>[1]</b>.
 No signup or login needed — just type.</div>
     </div>
@@ -155,6 +168,7 @@ No signup or login needed — just type.</div>
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const messages = $('#messages');
@@ -169,6 +183,247 @@ function addMsg(cls, text) {
 }
 
 let UPLOADS_ENABLED = false;
+let BROWSER_UPLOADS = false;
+
+// ==========================================================================
+// Browser-side document indexing ("Your documents")
+// PDF parsed locally -> chunks embedded via /api/embed -> vectors stored in
+// IndexedDB -> cosine search in the browser -> top-k sent to /api/ask.
+// ==========================================================================
+if (window.pdfjsLib) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+const CHUNK_SIZE = 900, CHUNK_OVERLAP = 150, MIN_PARA_LEN = 20;
+const EMBED_BATCH = 16, MAX_LOCAL_DOCS = 20, MAX_LOCAL_CHUNKS = 600;
+
+let _db = null;
+function idb() {
+  if (_db) return Promise.resolve(_db);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('pdf-rag-local', 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore('docs', { keyPath: 'doc_id' });
+      req.result.createObjectStore('chunks', { keyPath: 'id' });
+    };
+    req.onsuccess = () => { _db = req.result; resolve(_db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbAll(store) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store).objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbPut(store, rows) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const os = tx.objectStore(store);
+    for (const r of rows) os.put(r);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbDeleteDoc(docId) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['docs', 'chunks'], 'readwrite');
+    tx.objectStore('docs').delete(docId);
+    const cs = tx.objectStore('chunks');
+    const req = cs.openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { if (cur.value.doc_id === docId) cur.delete(); cur.continue(); }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// --- text cleaning + chunking (mirrors app/chunking.py exactly) ----------
+function cleanText(t) {
+  t = t.replace(/\x00/g, '');
+  t = t.replace(/(\w)-\n(\w)/g, '$1$2');   // de-hyphenate line breaks
+  t = t.replace(/[ \t]+/g, ' ');
+  return t.trim();
+}
+function chunkPages(pages) {
+  const paras = [];
+  pages.forEach((pageText, i) => {
+    for (const p of pageText.split(/\n\s*\n/)) {
+      const para = p.trim();
+      if (para.length >= MIN_PARA_LEN) paras.push([i + 1, para]);
+    }
+  });
+  const chunks = [];
+  let buf = [], bufPages = [];
+  const flush = () => {
+    const text = buf.join('\n\n').trim();
+    if (text) chunks.push({
+      text, page_start: Math.min(...bufPages), page_end: Math.max(...bufPages),
+      index: chunks.length,
+    });
+  };
+  for (const [pageNo, para] of paras) {
+    const projected = buf.reduce((s, p) => s + p.length, 0) + para.length + 2 * Math.max(buf.length - 1, 0);
+    if (buf.length && projected > CHUNK_SIZE) {
+      flush();
+      const tail = buf[buf.length - 1].slice(-CHUNK_OVERLAP);
+      const lastPage = bufPages[bufPages.length - 1];
+      [buf, bufPages] = tail.trim() ? [[tail], [lastPage]] : [[], []];
+    }
+    buf.push(para); bufPages.push(pageNo);
+  }
+  flush();
+  chunks.forEach((c, i) => c.index = i);
+  return chunks;
+}
+
+async function extractPdfPages(file) {
+  const data = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    try {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      let text = '', lastY = null;
+      for (const item of content.items) {
+        if (lastY !== null && Math.abs(item.transform[5] - lastY) > 2) text += '\n';
+        text += item.str + ' ';
+        lastY = item.transform[5];
+      }
+      pages.push(cleanText(text));
+    } catch { pages.push(''); }
+  }
+  return pages;
+}
+
+async function embedTexts(texts, onProgress) {
+  const out = [];
+  for (let i = 0; i < texts.length; i += EMBED_BATCH) {
+    const batch = texts.slice(i, i + EMBED_BATCH);
+    const r = await fetch('/api/embed', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts: batch }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || `Embedding failed (HTTP ${r.status})`);
+    out.push(...d.vectors);
+    if (onProgress) onProgress(Math.min(i + EMBED_BATCH, texts.length), texts.length);
+  }
+  return out;
+}
+
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return dot / ((Math.sqrt(na) * Math.sqrt(nb)) || 1);
+}
+
+async function localSearch(queryVec, k = 5) {
+  const chunks = await idbAll('chunks');
+  return chunks
+    .map(c => ({ ...c, score: cosine(queryVec, c.vector) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k);
+}
+
+async function localDocCount() {
+  return (await idbAll('docs')).length;
+}
+
+async function indexLocalPdf(file, progressEl) {
+  if (!window.pdfjsLib) throw new Error('PDF parser failed to load (check your connection).');
+  const pages = await extractPdfPages(file);
+  const chunks = chunkPages(pages);
+  if (!chunks.length) throw new Error('No extractable text found (scanned/image PDF?).');
+  const existing = await localDocCount();
+  const totalChunks = (await idbAll('chunks')).length + chunks.length;
+  if (existing >= MAX_LOCAL_DOCS) throw new Error(`Limit of ${MAX_LOCAL_DOCS} documents reached — delete one first.`);
+  if (totalChunks > MAX_LOCAL_CHUNKS) throw new Error(`Would exceed the ${MAX_LOCAL_CHUNKS}-chunk browser limit.`);
+
+  const docId = 'local_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+  if (progressEl) progressEl.textContent = 'Embedding 0/' + chunks.length + '…';
+  const vectors = await embedTexts(chunks.map(c => c.text), (done, total) => {
+    if (progressEl) progressEl.textContent = `Embedding ${done}/${total}…`;
+  });
+  const rows = chunks.map((c, i) => ({
+    id: docId + '_c' + i, doc_id: docId, text: c.text, vector: vectors[i],
+    source: file.name, page_start: c.page_start, page_end: c.page_end, chunk_index: i,
+  }));
+  await idbPut('chunks', rows);
+  await idbPut('docs', [{
+    doc_id: docId, source: file.name, chunks: chunks.length,
+    last_page: pages.length, added: Date.now(),
+  }]);
+  return { filename: file.name, num_pages: pages.length, num_chunks: chunks.length };
+}
+
+async function renderLocalDocs() {
+  const list = $('#localDocList');
+  if (!list) return;
+  const docs = (await idbAll('docs')).sort((a, b) => (b.added || 0) - (a.added || 0));
+  list.innerHTML = '';
+  if (!docs.length) {
+    list.innerHTML = '<div class="empty-note">No personal documents yet.</div>';
+    return;
+  }
+  for (const d of docs) {
+    const el = document.createElement('div');
+    el.className = 'doc';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const name = document.createElement('span');
+    name.className = 'name'; name.title = d.source;
+    name.textContent = d.source;
+    const tag = document.createElement('span');
+    tag.className = 'tag'; tag.textContent = 'yours';
+    name.appendChild(tag);
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    sub.textContent = `${d.chunks} chunks · ${d.last_page} pages`;
+    meta.append(name, sub);
+    const del = document.createElement('button');
+    del.title = 'Delete'; del.textContent = '✕';
+    del.onclick = async () => { await idbDeleteDoc(d.doc_id); renderLocalDocs(); };
+    el.append(meta, del);
+    list.appendChild(el);
+  }
+}
+
+// --- local upload wiring ---------------------------------------------------
+const ldz = $('#localDropzone'), lfi = $('#localFileInput');
+if (ldz) {
+  ldz.onclick = () => lfi.click();
+  lfi.onchange = () => localUpload(lfi.files);
+  ldz.ondragover = e => { e.preventDefault(); ldz.classList.add('drag'); };
+  ldz.ondragleave = () => ldz.classList.remove('drag');
+  ldz.ondrop = e => { e.preventDefault(); ldz.classList.remove('drag'); localUpload(e.dataTransfer.files); };
+}
+async function localUpload(files) {
+  if (!files || !files.length) return;
+  for (const f of files) {
+    if (!f.name.toLowerCase().endsWith('.pdf')) {
+      addMsg('bot error', `⚠️ ${f.name}: only PDF files are supported.`);
+      continue;
+    }
+    const note = addMsg('bot', `⏳ Indexing “${f.name}” in your browser…`);
+    try {
+      const res = await indexLocalPdf(f, note);
+      note.textContent = `✅ Indexed “${res.filename}” — ${res.num_pages} pages → ${res.num_chunks} chunks (stored on this device).`;
+    } catch (e) {
+      note.className = 'msg bot error';
+      note.textContent = `⚠️ ${f.name}: ${e.message}`;
+    }
+  }
+  lfi.value = '';
+  renderLocalDocs();
+}
 
 async function checkHealth() {
   try {
@@ -181,10 +436,16 @@ async function checkHealth() {
     $('#chunkBadge') && ($('#chunkBadge').textContent =
       `${d.chunks_indexed} chunks · ${d.embedding_model || ''}`);
 
-    // read-only mode: hide uploader, show note
+    // read-only mode: hide server uploader, show note
     UPLOADS_ENABLED = !!d.uploads_enabled;
     $('#uploadArea').style.display = UPLOADS_ENABLED ? '' : 'none';
     $('#readOnlyNote').style.display = UPLOADS_ENABLED ? 'none' : '';
+
+    // browser-side uploads ("Your documents"): available wherever the
+    // embedding proxy is configured (HF_TOKEN on the server)
+    BROWSER_UPLOADS = !!d.browser_uploads;
+    $('#localUploadArea').style.display = BROWSER_UPLOADS ? '' : 'none';
+    $('#localUnavailableNote').style.display = BROWSER_UPLOADS ? 'none' : '';
 
     // mode picker: agent/research buttons enabled only when backend reports available
     const ag = d.agent || {};
@@ -293,14 +554,39 @@ $('#askForm').onsubmit = async e => {
   messages.appendChild(typing); messages.scrollTop = messages.scrollHeight;
 
   try {
+    // Browser-indexed documents: embed the question, retrieve locally,
+    // and merge the hits into the request as client contexts.
+    let contexts = null;
+    let localHits = 0;
+    if (BROWSER_UPLOADS && (await localDocCount()) > 0) {
+      try {
+        const [qv] = await embedTexts([q]);
+        const hits = await localSearch(qv, 5);
+        if (hits.length) {
+          localHits = hits.length;
+          contexts = hits.map(h => ({
+            text: h.text, source: h.source,
+            page_start: h.page_start, page_end: h.page_end, score: h.score,
+          }));
+        }
+      } catch (e) {
+        console.warn('local retrieval failed, falling back to server index', e);
+      }
+    }
     // Send the selected mode; '' (not yet known) lets the server decide.
+    // With client contexts the server generates from them (classic path).
     const r = await fetch('/api/ask', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ question: q, mode: CURRENT_MODE || null })
+      body: JSON.stringify({
+        question: q,
+        mode: contexts ? 'classic' : (CURRENT_MODE || null),
+        contexts,
+      })
     });
     const d = await r.json();
     typing.remove();
     if (!r.ok) { addMsg('bot error', d.detail || 'Request failed'); return; }
+    if (localHits) d._localNote = `Answered from your ${localHits} locally-indexed chunk(s).`;
     renderAnswer(d);
   } catch (e) {
     typing.remove();
@@ -314,6 +600,12 @@ function renderAnswer(d) {
   const div = document.createElement('div');
   div.className = 'msg bot';
   div.textContent = d.answer;
+  if (d._localNote) {
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:11.5px;color:var(--accent2);margin-top:8px';
+    note.textContent = '📌 ' + d._localNote;
+    div.appendChild(note);
+  }
   const chips = document.createElement('div');
   chips.className = 'cite-chips';
   (d.citations || []).forEach(c => {
@@ -411,6 +703,7 @@ $('#copyBtn').onclick = async () => {
 };
 
 checkHealth().then(loadDocs);
+renderLocalDocs();
 setInterval(checkHealth, 20000);
 </script>
 </body>

@@ -56,6 +56,13 @@ class AskRequest(BaseModel):
     doc_id: str | None = None
     agent: bool | None = None  # None = server decides (RAG_AGENT_MODE)
     mode: str | None = None    # "classic" | "agent" | "research" (overrides `agent`)
+    # Browser-indexed documents (client-side retrieval): the client sends its
+    # own top-k chunks; the server only generates the cited answer.
+    contexts: list[dict] | None = None
+
+
+class EmbedRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=32)
 
 
 class Citation(BaseModel):
@@ -79,6 +86,7 @@ def _rate_limit(request: Request, kind: str) -> None:
         "ask": config.RATE_LIMIT_ASK,
         "search": config.RATE_LIMIT_SEARCH,
         "upload": config.RATE_LIMIT_UPLOAD,
+        "embed": config.RATE_LIMIT_EMBED,
     }[kind]
     ip = request.client.host if request.client else "unknown"
     now = time.monotonic()
@@ -144,6 +152,70 @@ def _parse_citations(answer: str, hits: list[dict]) -> tuple[str, list[Citation]
         i + 1 for i, h in enumerate(hits[:3]) if h["score"] >= SIMILARITY_FLOOR
     ] or [1]
     return answer, [make_citation(n, auto=True) for n in auto_hits]
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed texts server-side via the HF feature-extraction proxy.
+
+    Used by /api/embed so browser-indexed uploads never see the HF token.
+    Raises HTTPException on any failure (the UI surfaces the message).
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    if not config.HF_TOKEN:
+        raise HTTPException(
+            503, "Embedding proxy is not configured on this deployment (no HF_TOKEN)."
+        )
+    req = urllib.request.Request(
+        config.HF_EMBED_URL,
+        data=_json.dumps({"inputs": texts}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.HF_TOKEN}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            vectors = _json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Embedding service error (HTTP {exc.code}).") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(502, f"Embedding service unreachable ({exc.reason}).") from exc
+    if not isinstance(vectors, list) or len(vectors) != len(texts):
+        raise HTTPException(502, "Embedding service returned an unexpected payload.")
+    return [[float(x) for x in v] for v in vectors]
+
+
+def _client_hits(contexts: list[dict]) -> list[dict]:
+    """Validate + normalize client-provided chunks into the standard hit shape."""
+    hits: list[dict] = []
+    for i, c in enumerate(contexts[:10]):
+        text = str(c.get("text", ""))[:6000]
+        if not text.strip():
+            continue
+        try:
+            page_start = max(1, int(c.get("page_start", 1)))
+            page_end = max(page_start, int(c.get("page_end", page_start)))
+        except (TypeError, ValueError):
+            page_start = page_end = 1
+        hits.append(
+            {
+                "id": f"client_c{i}",
+                "text": text,
+                "metadata": {
+                    "source": str(c.get("source", "your document"))[:200],
+                    "doc_id": "client",
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "chunk_index": i,
+                },
+                "score": float(c.get("score", 0.0)),
+            }
+        )
+    return hits
 
 
 def _agent_response(result: dict, t0: float) -> dict:
@@ -222,6 +294,7 @@ def health():
             "chunks_indexed": 0,
             "deployment": config.DEPLOYMENT,
             "uploads_enabled": False,
+            "browser_uploads": bool(config.HF_TOKEN),
             "agent": {
                 "mode": config.AGENT_MODE,
                 "available": agent.available(),
@@ -239,6 +312,7 @@ def health():
         "chunks_indexed": chunks,
         "deployment": config.DEPLOYMENT,
         "uploads_enabled": not config.SERVERLESS,
+        "browser_uploads": bool(config.HF_TOKEN),
         "agent": {
             "mode": config.AGENT_MODE,
             "available": agent.available(),
@@ -328,10 +402,70 @@ def search(request: Request, req: SearchRequest):
     }
 
 
+@app.post("/api/embed")
+def embed(request: Request, req: EmbedRequest):
+    """Embedding proxy for browser-side document indexing.
+
+    The UI parses/chunks PDFs locally, sends chunk texts here in batches,
+    and stores the returned vectors in the browser (IndexedDB). The HF token
+    never leaves the server.
+    """
+    _rate_limit(request, "embed")
+    texts = [t.strip() for t in req.texts]
+    if any(len(t) > 4000 for t in texts):
+        raise HTTPException(422, "Each text must be at most 4000 characters.")
+    if not all(texts):
+        raise HTTPException(422, "Empty texts are not allowed.")
+    vectors = _embed_texts(texts)
+    return {"vectors": vectors, "dim": len(vectors[0]) if vectors else 0}
+
+
 @app.post("/api/ask")
 def ask(request: Request, req: AskRequest):
     _rate_limit(request, "ask")
     t0 = time.perf_counter()
+
+    # ---- Client-provided contexts (browser-indexed documents) ------------
+    # The client already retrieved its own top-k chunks; we only generate.
+    if req.contexts:
+        hits = _client_hits(req.contexts)
+        if not hits:
+            raise HTTPException(422, "No usable contexts were provided.")
+        retrieval_ms = 0
+        t1 = time.perf_counter()
+        backend = config.effective_llm_backend()
+        if backend == "extractive":
+            from . import extractive
+
+            answer = extractive.extractive_answer(req.question, hits)
+        else:
+            prompt = prompts.build_answer_prompt(req.question, hits)
+            try:
+                answer = llm.generate(prompt, system=prompts.SYSTEM_PROMPT)
+            except llm.LLMError as exc:
+                raise HTTPException(503, str(exc)) from exc
+        generation_ms = int((time.perf_counter() - t1) * 1000)
+        answer, citations = _parse_citations(answer, hits)
+        return {
+            "answer": answer,
+            "citations": [c.model_dump() for c in citations],
+            "sources": [
+                {
+                    "text": h["text"],
+                    "source": h["metadata"]["source"],
+                    "page_start": h["metadata"]["page_start"],
+                    "page_end": h["metadata"]["page_end"],
+                    "score": h["score"],
+                }
+                for h in hits
+            ],
+            "timing": {
+                "retrieval_ms": retrieval_ms,
+                "generation_ms": generation_ms,
+                "best_similarity": hits[0]["score"],
+            },
+            "client_indexed": True,
+        }
 
     # ---- Agentic paths (LangGraph) ---------------------------------------
     from . import agent
