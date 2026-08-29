@@ -1,16 +1,24 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local data (rebuildable)
 data/chroma/
 data/uploads/
-.env
-spaces/_build/
-.vercel/
 
-.vercel
-
+# Bundled embedding-model cache for serverless cold starts (87MB ONNX
+# weights — too big for git; `vercel --prod` bundles it from local disk,
+# fastembed auto-downloads it for everyone else)
 assets/
-qr/*placeholder*
 
+# Secrets
+.env
+
+# Build artifacts
 report_build/
+spaces/_build/
+
+# Local tooling
+.vercel/
