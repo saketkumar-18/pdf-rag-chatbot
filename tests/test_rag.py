@@ -104,7 +104,7 @@ def test_store_roundtrip_and_dedup(demo_pdf):
 # ----------------------------------------------------------------------
 # API end-to-end (generative when local Ollama is running; extractive otherwise)
 # ----------------------------------------------------------------------
-def test_api_full_flow(demo_pdf):
+def test_api_full_flow(demo_pdf, monkeypatch):
     from fastapi.testclient import TestClient
 
     from app.main import app
@@ -115,10 +115,24 @@ def test_api_full_flow(demo_pdf):
     health = client.get("/api/health").json()
     assert health["status"] == "ok"
     # llm_ready depends on a local Ollama daemon (CI and cold machines run
-    # without one — the app then answers via the built-in extractive engine).
+    # without one; the ask step below then uses a mocked generator).
     assert isinstance(health["llm_ready"], bool)
     assert health["uploads_enabled"] is True
     assert health["deployment"] == "local"
+
+    if not health["llm_ready"]:
+        from app import llm as llm_mod
+
+        # No daemon in this environment (e.g. CI): mock only the generation
+        # step with a grounded, cited reply so the rest of the flow —
+        # upload, search, citations, scoped retrieval, delete — runs for real.
+        def _fake_generate(prompt, system=None, model=None):
+            assert "chunk" in prompt.lower() or "context" in prompt.lower(), (
+                "generate() should receive the retrieved context"
+            )
+            return "The model was trained on eight NVIDIA P100 GPUs. [1]"
+
+        monkeypatch.setattr(llm_mod, "generate", _fake_generate)
 
     # upload
     with demo_pdf.open("rb") as fh:

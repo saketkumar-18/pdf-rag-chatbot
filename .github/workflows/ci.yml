@@ -12,8 +12,9 @@ jobs:
     timeout-minutes: 20
     env:
       RAG_DEPLOYMENT: local
-      # No Ollama daemon in CI: the app gracefully falls back to the built-in
-      # extractive engine, and all LLM-touching agent tests are fully mocked.
+      # No Ollama daemon in CI. Agent tests fully mock the LLM layer; the
+      # end-to-end API test mocks llm.generate only when no daemon answers,
+      # so every endpoint still runs for real. No secrets required.
       RAG_AGENT_MODE: "off"
     steps:
       - uses: actions/checkout@v4
