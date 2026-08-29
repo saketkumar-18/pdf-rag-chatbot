@@ -412,8 +412,6 @@ def embed(request: Request, req: EmbedRequest):
     """
     _rate_limit(request, "embed")
     texts = [t.strip() for t in req.texts]
-    if any(len(t) > 4000 for t in texts):
-        raise HTTPException(422, "Each text must be at most 4000 characters.")
     if not all(texts):
         raise HTTPException(422, "Empty texts are not allowed.")
     vectors = _embed_texts(texts)

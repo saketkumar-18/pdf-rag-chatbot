@@ -115,8 +115,8 @@ Even on the read-only Vercel deployment, every visitor can add their own PDFs:
    local chunks, and sends its top-k hits to `/api/ask` as `contexts`; the
    server generates the cited answer from them.
 
-Limits: 20 documents / 600 chunks per browser, 32 texts per embed batch
-(≤4000 chars each), 15 embed requests/min per IP.
+Limits: 50 documents / 5000 chunks per browser, 32 texts per embed batch,
+15 embed requests/min per IP.
 
 ## Deploy to Vercel (free)
 
@@ -230,7 +230,7 @@ synthesize → check`, and `subqueries` lists the planner's decomposition.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RAG_LLM_BACKEND` | `ollama` | `ollama` (local) or `hf` (HF serverless Inference API) |
+| `RAG_LLM_BACKEND` | `auto` | `auto` (local→ollama, serverless→openai), `ollama`, or any OpenAI-compatible `openai` API |
 | `RAG_LLM_MODEL` | `llama3.2:1b` | Ollama model tag (ollama backend) |
 | `RAG_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon |
 | `HF_TOKEN` | — | free token from huggingface.co/settings/tokens (hf backend) |
@@ -246,7 +246,7 @@ synthesize → check`, and `subqueries` lists the planner's decomposition.
 | `RAG_RESEARCH_MAX_FINDINGS` | 8 | cap on unique chunks passed to synthesis |
 | `RAG_MAX_UPLOAD_MB` | 50 | upload limit |
 
-## Hugging Face: LLM + embeddings backend (not hosting)
+## Hugging Face as an LLM/embeddings backend
 
 HF **Docker Spaces now require a PRO subscription** (free accounts get static
 HTML Spaces only), so HF is used here as the *brain*, not the *host*:
@@ -258,8 +258,7 @@ HTML Spaces only), so HF is used here as the *brain*, not the *host*:
 - **Embeddings at build time** — `scripts/build_index.py` can embed via the
   `hf-inference` feature-extraction endpoint instead of local fastembed.
 
-Hosting itself is on Vercel (see above). The `spaces/` folder keeps an
-experimental Docker Space image for PRO users.
+Hosting itself is on Vercel (see above).
 
 ## Design notes
 

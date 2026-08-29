@@ -32,6 +32,33 @@ _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 MIN_PARA_LEN = 20  # ignore page numbers / stray headers / footers
 
 
+def _split_oversized(text: str, limit: int) -> list[str]:
+    """Hard-split a paragraph longer than `limit` (e.g. a whole page with no
+    blank lines, common with pdf.js extraction). Prefers sentence boundaries,
+    falls back to word boundaries, then a hard cut. Resulting pieces are
+    guaranteed to be <= limit."""
+    parts: list[str] = []
+    while len(text) > limit:
+        window = text[:limit]
+        cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut < limit // 4:
+            cut = limit
+        else:
+            cut += 1  # keep the delimiter with the left part
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        # Final safety: ensure the last piece is also within limit
+        if len(text) > limit:
+            # This shouldn't normally happen, but just in case
+            parts.extend(_split_oversized(text, limit))
+        else:
+            parts.append(text)
+    return parts
+
+
 def _clean(text: str) -> str:
     """Normalize whitespace and drop hyphenation artifacts from line breaks."""
     text = text.replace("\x00", "")
@@ -59,7 +86,15 @@ def chunk_pages(pages: list[str]) -> list[Chunk]:
     for page_no, page_text in enumerate(pages, start=1):
         for para in _PARAGRAPH_SPLIT.split(page_text):
             para = para.strip()
-            if len(para) >= MIN_PARA_LEN:
+            if len(para) < MIN_PARA_LEN:
+                continue
+            # A paragraph longer than a full chunk (whole page with no blank
+            # lines) must be split or it can never fit the packing budget.
+            if len(para) > config.CHUNK_SIZE:
+                for piece in _split_oversized(para, config.CHUNK_SIZE):
+                    if len(piece) >= MIN_PARA_LEN:
+                        paragraphs.append((page_no, piece))
+            else:
                 paragraphs.append((page_no, para))
 
     chunks: list[Chunk] = []
@@ -69,25 +104,59 @@ def chunk_pages(pages: list[str]) -> list[Chunk]:
     def flush() -> None:
         text = "\n\n".join(buf).strip()
         if text:
-            chunks.append(
-                Chunk(
-                    text=text,
-                    page_start=min(buf_pages),
-                    page_end=max(buf_pages),
-                    index=len(chunks),
+            # HARD CAP (safety net): if the assembled chunk still exceeds the
+            # budget, split it. The carried overlap tail duplicates content the
+            # previous chunk already holds, so it gets an allowance on top of
+            # CHUNK_SIZE — this keeps the overlap contract intact while still
+            # guaranteeing no pathological oversized chunks.
+            limit = config.CHUNK_SIZE + config.CHUNK_OVERLAP
+            if len(text) > limit:
+                pieces = _split_oversized(text, limit)
+                for piece in pieces:
+                    chunks.append(
+                        Chunk(
+                            text=piece,
+                            page_start=min(buf_pages),
+                            page_end=max(buf_pages),
+                            index=len(chunks),
+                        )
+                    )
+            else:
+                chunks.append(
+                    Chunk(
+                        text=text,
+                        page_start=min(buf_pages),
+                        page_end=max(buf_pages),
+                        index=len(chunks),
+                    )
                 )
-            )
 
     for page_no, para in paragraphs:
-        projected = sum(len(p) for p in buf) + len(para) + 2 * max(len(buf) - 1, 0)
+        # Pre-calculate projected size INCLUDING the overlap tail that will be
+        # carried forward from the previous chunk (if any). This ensures the
+        # actual chunk content (tail + "\n\n" + new paragraphs) never exceeds
+        # CHUNK_SIZE.
+        tail = buf[-1][-config.CHUNK_OVERLAP:] if buf else ""
+        tail_len = len(tail) + (2 if tail and buf else 0)  # "\n\n" separator
+        projected = tail_len + sum(len(p) for p in buf) + len(para) + 2 * max(len(buf) - 1, 0)
         if buf and projected > config.CHUNK_SIZE:
             flush()
             # carry a tail from the previous chunk for overlap continuity
             tail = buf[-1][-config.CHUNK_OVERLAP:]
             last_page = buf_pages[-1]
             buf, buf_pages = ([tail], [last_page]) if tail.strip() else ([], [])
+            # Check if overlap tail itself exceeds chunk size (shouldn't happen
+            # but safe-guard)
+            if buf and len(tail) > config.CHUNK_SIZE:
+                flush()
+                buf, buf_pages = [], []
         buf.append(para)
         buf_pages.append(page_no)
+        # Hard guard: if a single paragraph exceeds CHUNK_SIZE after all
+        # splitting attempts, flush immediately to prevent oversized chunks
+        if len(buf) == 1 and len(para) > config.CHUNK_SIZE:
+            flush()
+            buf, buf_pages = [], []
     flush()
 
     # Renumber sequentially now that packing is final.

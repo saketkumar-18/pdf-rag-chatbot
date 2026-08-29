@@ -102,7 +102,7 @@ def test_store_roundtrip_and_dedup(demo_pdf):
 
 
 # ----------------------------------------------------------------------
-# API end-to-end (includes real LLM call against local Ollama)
+# API end-to-end (generative when local Ollama is running; extractive otherwise)
 # ----------------------------------------------------------------------
 def test_api_full_flow(demo_pdf):
     from fastapi.testclient import TestClient
@@ -114,7 +114,9 @@ def test_api_full_flow(demo_pdf):
     # health
     health = client.get("/api/health").json()
     assert health["status"] == "ok"
-    assert health["llm_ready"] is True
+    # llm_ready depends on a local Ollama daemon (CI and cold machines run
+    # without one — the app then answers via the built-in extractive engine).
+    assert isinstance(health["llm_ready"], bool)
     assert health["uploads_enabled"] is True
     assert health["deployment"] == "local"
 

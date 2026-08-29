@@ -195,7 +195,7 @@ if (window.pdfjsLib) {
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 }
 const CHUNK_SIZE = 900, CHUNK_OVERLAP = 150, MIN_PARA_LEN = 20;
-const EMBED_BATCH = 16, MAX_LOCAL_DOCS = 20, MAX_LOCAL_CHUNKS = 600;
+const EMBED_BATCH = 32, MAX_LOCAL_DOCS = 50, MAX_LOCAL_CHUNKS = 5000;
 
 let _db = null;
 function idb() {
@@ -251,32 +251,82 @@ function cleanText(t) {
   t = t.replace(/[ \t]+/g, ' ');
   return t.trim();
 }
+// Hard-split a paragraph longer than a full chunk (whole page with no blank
+// lines — the normal pdf.js case). Prefers sentence, then word boundaries.
+function splitOversized(text, limit) {
+  const parts = [];
+  while (text.length > limit) {
+    const window = text.slice(0, limit);
+    let cut = Math.max(window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '));
+    if (cut < limit / 2) cut = window.lastIndexOf(' ');
+    if (cut < limit / 4) cut = limit; else cut += 1;
+    parts.push(text.slice(0, cut).trim());
+    text = text.slice(cut).trim();
+  }
+  if (text) parts.push(text);
+  return parts;
+}
 function chunkPages(pages) {
   const paras = [];
   pages.forEach((pageText, i) => {
     for (const p of pageText.split(/\n\s*\n/)) {
       const para = p.trim();
-      if (para.length >= MIN_PARA_LEN) paras.push([i + 1, para]);
+      if (para.length < MIN_PARA_LEN) continue;
+      if (para.length > CHUNK_SIZE) {
+        for (const piece of splitOversized(para, CHUNK_SIZE)) {
+          if (piece.length >= MIN_PARA_LEN) paras.push([i + 1, piece]);
+        }
+      } else {
+        paras.push([i + 1, para]);
+      }
     }
   });
   const chunks = [];
   let buf = [], bufPages = [];
   const flush = () => {
     const text = buf.join('\n\n').trim();
-    if (text) chunks.push({
-      text, page_start: Math.min(...bufPages), page_end: Math.max(...bufPages),
-      index: chunks.length,
-    });
+    if (text) {
+      // HARD CAP (safety net): the carried overlap tail duplicates content
+      // the previous chunk already holds, so it gets an allowance on top of
+      // CHUNK_SIZE — keeps the overlap contract intact.
+      const limit = CHUNK_SIZE + CHUNK_OVERLAP;
+      if (text.length > limit) {
+        const pieces = splitOversized(text, limit);
+        for (const piece of pieces) {
+          chunks.push({
+            text: piece, page_start: Math.min(...bufPages), page_end: Math.max(...bufPages),
+            index: chunks.length,
+          });
+        }
+      } else {
+        chunks.push({
+          text, page_start: Math.min(...bufPages), page_end: Math.max(...bufPages),
+          index: chunks.length,
+        });
+      }
+    }
   };
   for (const [pageNo, para] of paras) {
-    const projected = buf.reduce((s, p) => s + p.length, 0) + para.length + 2 * Math.max(buf.length - 1, 0);
+    // Pre-calculate projected size INCLUDING the overlap tail
+    const tail = buf.length ? buf[buf.length - 1].slice(-CHUNK_OVERLAP) : "";
+    const tailLen = tail.length + (tail && buf.length ? 2 : 0);
+    const projected = tailLen + buf.reduce((s, p) => s + p.length, 0) + para.length + 2 * Math.max(buf.length - 1, 0);
     if (buf.length && projected > CHUNK_SIZE) {
       flush();
       const tail = buf[buf.length - 1].slice(-CHUNK_OVERLAP);
       const lastPage = bufPages[bufPages.length - 1];
       [buf, bufPages] = tail.trim() ? [[tail], [lastPage]] : [[], []];
+      if (buf.length && tail.length > CHUNK_SIZE) {
+        flush();
+        [buf, bufPages] = [[], []];
+      }
     }
     buf.push(para); bufPages.push(pageNo);
+    // Hard guard: single oversized paragraph
+    if (buf.length === 1 && para.length > CHUNK_SIZE) {
+      flush();
+      [buf, bufPages] = [[], []];
+    }
   }
   flush();
   chunks.forEach((c, i) => c.index = i);
